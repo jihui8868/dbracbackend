@@ -47,6 +47,37 @@ async def create_session(
     return {"id": str(conversation.id), "created_at": conversation.created_at}
 
 
+@router.get("/{conversation_id}/messages")
+async def get_messages(
+    conversation_id: UUID,
+    current_user: UserResponse = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+):
+    conversation = await get_conversation(session, conversation_id)
+    if not conversation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        )
+
+    if conversation.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized",
+        )
+
+    messages = await get_conversation_messages(session, conversation_id)
+    return [
+        {
+            "id": str(msg.id),
+            "role": msg.role.value,
+            "content": msg.content,
+            "created_at": msg.created_at,
+        }
+        for msg in messages
+    ]
+
+
 @router.post("/{conversation_id}/message")
 async def stream_message(
     conversation_id: UUID,
