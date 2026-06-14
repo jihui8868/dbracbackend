@@ -109,14 +109,35 @@ async def stream_message(
 
     async def stream_response():
         full_response = ""
+        assistant_message_content = ""
         try:
-            async for chunk in agent.run_stream(messages):
-                full_response += chunk
-                yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
+            async for event_json in agent.run_stream(messages):
+                # 事件已经是 JSON 格式，直接作为 JSON Lines 返回
+                yield f"{event_json}\n"
 
-            await add_message(session, conversation_id, MessageRole.assistant, full_response)
-            yield f"data: {json.dumps({'type': 'done', 'content': ''})}\n\n"
+                # 收集响应内容用于数据库存储
+                try:
+                    event = json.loads(event_json)
+                    event_type = event.get("event")
+                    event_data = event.get("data", {})
+
+                    if event_type == "llm_stream" and event_data.get("content"):
+                        assistant_message_content += event_data.get("content", "")
+                    elif event_type == "agent_end" and event_data.get("output"):
+                        if not assistant_message_content:
+                            assistant_message_content = event_data.get("output", "")
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
+            # 存储最终的助手消息
+            if assistant_message_content:
+                await add_message(session, conversation_id, MessageRole.assistant, assistant_message_content)
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+            import traceback
+            traceback.print_exc()
+            yield json.dumps({
+                "event": "error",
+                "data": {"message": str(e)}
+            }) + "\n"
 
     return StreamingResponse(stream_response(), media_type="text/event-stream")

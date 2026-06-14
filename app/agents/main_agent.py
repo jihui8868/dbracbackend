@@ -3,6 +3,7 @@
 实现真正的事件流式处理
 """
 import json
+import sys
 from typing import AsyncIterator
 
 from deepagents import create_deep_agent
@@ -10,6 +11,13 @@ from langchain_openai import ChatOpenAI
 
 from app.core.config import settings
 from app.agents.subagents import ALL_TOOLS
+
+
+def normalize_event_name(event_type: str) -> str:
+    """规范化事件名称，去掉 'on_' 前缀"""
+    if event_type and event_type.startswith("on_"):
+        return event_type[3:]
+    return event_type or ""
 
 
 class DeepChatAgent:
@@ -115,11 +123,13 @@ class DeepChatAgent:
                 {"messages": [{"role": "user", "content": full_prompt}]},
                 version="v1",  # 使用最新的事件版本
             ):
-                event_type = event.get("event")
+                raw_event_type = event.get("event", "")
+                event_type = normalize_event_name(raw_event_type)
                 data = event.get("data", {})
 
+
                 # 处理不同类型的事件
-                if event_type == "on_llm_start":
+                if event_type == "chat_model_start":
                     # LLM 开始处理
                     yield json.dumps(
                         {
@@ -131,24 +141,33 @@ class DeepChatAgent:
                         }
                     )
 
-                elif event_type == "on_llm_stream":
-                    # LLM 流式输出 - 真正的流式内容
+                elif event_type == "chat_model_stream":
+                    # LLM 流式输出 - 从 on_chat_model_stream 事件获取
+                    content = None
                     if "chunk" in data:
                         chunk = data["chunk"]
-                        if hasattr(chunk, "content") and chunk.content:
-                            yield json.dumps(
-                                {
-                                    "event": "llm_stream",
-                                    "data": {
-                                        "content": chunk.content,
-                                        "run_id": event.get("run_id"),
-                                    },
-                                }
-                            )
+                        if hasattr(chunk, "content"):
+                            content = chunk.content
 
-                elif event_type == "on_tool_start":
+                    if content:
+                        yield json.dumps(
+                            {
+                                "event": "llm_stream",
+                                "data": {
+                                    "content": content,
+                                    "run_id": event.get("run_id"),
+                                },
+                            }
+                        )
+
+                elif event_type == "tool_start":
                     # 工具开始执行
-                    tool_name = data.get("payload", {}).get("name", "unknown")
+                    tool_name = "unknown"
+
+                    # 从 event 的 name 字段提取工具名
+                    if "name" in event:
+                        tool_name = event.get("name", "unknown")
+
                     yield json.dumps(
                         {
                             "event": "tool_start",
@@ -160,23 +179,28 @@ class DeepChatAgent:
                         }
                     )
 
-                elif event_type == "on_tool_end":
+                elif event_type == "tool_end":
                     # 工具执行完成
-                    tool_name = data.get("payload", {}).get("name", "unknown")
+                    tool_name = "unknown"
+
+                    # 从 event 的 name 字段提取工具名
+                    if "name" in event:
+                        tool_name = event.get("name", "unknown")
+
                     tool_output = data.get("output", "")
                     yield json.dumps(
                         {
                             "event": "tool_end",
                             "data": {
                                 "tool": tool_name,
-                                "output": str(tool_output)[:500],  # 限制输出大小
+                                "output": str(tool_output)[:500],
                                 "message": f"工具 {tool_name} 执行完成",
                                 "run_id": event.get("run_id"),
                             },
                         }
                     )
 
-                elif event_type == "on_agent_action":
+                elif event_type == "agent_action":
                     # 代理采取行动
                     yield json.dumps(
                         {
@@ -188,20 +212,52 @@ class DeepChatAgent:
                         }
                     )
 
-                elif event_type == "on_chain_end":
-                    # 链/代理执行完成
-                    output = data.get("output", "")
+                elif event_type in ["chain_end"]:
+                    # 链执行完成 - 提取有意义的输出
+                    output = data.get("output")
+
                     if output:
-                        yield json.dumps(
-                            {
-                                "event": "agent_end",
-                                "data": {
-                                    "output": str(output),
-                                    "message": "代理处理完成",
-                                    "run_id": event.get("run_id"),
-                                },
-                            }
-                        )
+                        output_str = str(output)
+                        extracted_text = None
+
+                        # 尝试从 LangChain 消息结构中提取实际内容
+                        try:
+                            # 如果输出包含 AIMessage，提取其 content
+                            if "AIMessage(content=" in output_str:
+                                # 查找 content= 后的引号
+                                start = output_str.find("content='") + len("content='")
+                                if start > len("content='"):
+                                    end = output_str.find("'", start)
+                                    if end > start:
+                                        extracted_text = output_str[start:end]
+                                # 如果单引号不行，尝试双引号
+                                if not extracted_text:
+                                    start = output_str.find('content="') + len('content="')
+                                    if start > len('content="'):
+                                        end = output_str.find('"', start)
+                                        if end > start:
+                                            extracted_text = output_str[start:end]
+                        except Exception:
+                            pass
+
+                        # 如果成功提取了文本，使用它；否则使用原始输出
+                        final_output = extracted_text if extracted_text else output_str
+
+                        # 只在输出看起来有用时发出事件
+                        # 过滤掉明显是内部结构的输出
+                        if not final_output.startswith("[Command(") and \
+                           not (final_output.startswith("{") and "messages" in final_output) and \
+                           len(final_output.strip()) > 0:
+                            yield json.dumps(
+                                {
+                                    "event": "agent_end",
+                                    "data": {
+                                        "output": final_output,
+                                        "message": "代理处理完成",
+                                        "run_id": event.get("run_id"),
+                                    },
+                                }
+                            )
 
             # 发送完成信号
             yield json.dumps(
